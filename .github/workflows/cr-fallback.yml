@@ -1,0 +1,164 @@
+name: CodeRabbit fallback (Alibaba open-code-review)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Allow manual rerun if CR comes back online and posts a stale failure
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review
+        required: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so OCR can diff against base
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number || inputs.pr_number }}"
+          echo "number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          # Base ref
+          BASE="${{ github.event.pull_request.base.ref || 'main' }}"
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+
+      - name: Wait for CodeRabbit to attempt review
+        run: sleep 180  # 3 minutes — usually enough for CR to post
+
+      - name: Check CodeRabbit status
+        id: cr_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # Pull latest CR comment body
+          BODY=$(gh pr view ${{ steps.pr.outputs.number }} \
+            --repo "${{ github.repository }}" \
+            --json comments \
+            --jq '[.comments[] | select(.author.login == "coderabbitai")] | last | .body // ""')
+
+          if [ -z "$BODY" ]; then
+            echo "status=missing" >> $GITHUB_OUTPUT
+            echo "CodeRabbit has not posted any comment yet."
+          elif echo "$BODY" | grep -qiE "(rate limited by coderabbit|Review limit reached|couldn't start this review|Failed to start review)"; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "CodeRabbit appears rate-limited / failed."
+          else
+            echo "status=ok" >> $GITHUB_OUTPUT
+            echo "CodeRabbit review looks healthy — nothing to do."
+          fi
+
+      - name: Check we already posted (idempotent)
+        id: already
+        if: steps.cr_check.outputs.status != 'ok'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUR_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          POSTED=$(gh pr view ${{ steps.pr.outputs.number }} \
+            --repo "${{ github.repository }}" \
+            --json comments \
+            --jq '[.comments[] | select(.body | contains("🐰 CodeRabbit fallback")) | select(.body | contains("'$OUR_SHA'"))] | length')
+          echo "skip=$([ "$POSTED" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Set up Node
+        if: steps.cr_check.outputs.status != 'ok' && steps.already.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install OCR
+        if: steps.cr_check.outputs.status != 'ok' && steps.already.outputs.skip == 'false'
+        run: npm install -g @alibaba-group/open-code-review
+
+      - name: Configure OCR provider (pick first available secret)
+        if: steps.cr_check.outputs.status != 'ok' && steps.already.outputs.skip == 'false'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          if [ -n "$DEEPSEEK_API_KEY" ]; then
+            ocr config set llm.provider deepseek
+            ocr config set llm.model deepseek-chat
+            echo "Using Deepseek."
+          elif [ -n "$ANTHROPIC_API_KEY" ]; then
+            ocr config set llm.provider anthropic
+            ocr config set llm.model claude-sonnet-4-6
+            echo "Using Anthropic."
+          elif [ -n "$OPENAI_API_KEY" ]; then
+            ocr config set llm.provider openai
+            ocr config set llm.model gpt-4o
+            echo "Using OpenAI."
+          elif [ -n "$KIMI_API_KEY" ]; then
+            ocr config set llm.provider kimi
+            ocr config set llm.model moonshot-v1-32k
+            echo "Using Kimi."
+          else
+            echo "::error::No LLM API key configured. Add DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or KIMI_API_KEY as a repo secret."
+            exit 1
+          fi
+
+      - name: Run OCR review
+        if: steps.cr_check.outputs.status != 'ok' && steps.already.outputs.skip == 'false'
+        id: ocr
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          # Make sure the base branch is fetched
+          git fetch origin "${{ steps.pr.outputs.base }}:refs/remotes/origin/${{ steps.pr.outputs.base }}" 2>/dev/null || true
+          set +e
+          ocr review \
+            --from "origin/${{ steps.pr.outputs.base }}" \
+            --to HEAD \
+            --format text \
+            --audience agent \
+            > /tmp/ocr-review.txt 2>/tmp/ocr-err.log
+          RC=$?
+          set -e
+          echo "exit_code=$RC" >> $GITHUB_OUTPUT
+          if [ $RC -ne 0 ]; then
+            echo "::warning::OCR exited $RC"
+            tail -20 /tmp/ocr-err.log || true
+          fi
+
+      - name: Post OCR fallback comment
+        if: steps.cr_check.outputs.status != 'ok' && steps.already.outputs.skip == 'false' && steps.ocr.outputs.exit_code == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUR_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          {
+            echo "### 🐰 CodeRabbit fallback — Alibaba open-code-review"
+            echo ""
+            if [ "${{ steps.cr_check.outputs.status }}" = "failed" ]; then
+              echo "_CodeRabbit was rate-limited — posting the OCR review instead._"
+            else
+              echo "_CodeRabbit hadn't posted a review after 3 minutes — running OCR as fallback._"
+            fi
+            echo ""
+            echo "**Commit reviewed**: \`$OUR_SHA\`"
+            echo ""
+            echo "---"
+            echo ""
+            # Strip ANSI escape codes (OCR emits colors even in text/agent mode)
+            sed -E 's/\x1b\[[0-9;]*[mGKHF]//g' /tmp/ocr-review.txt
+          } > /tmp/comment.md
+          gh pr comment "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}" --body-file /tmp/comment.md
